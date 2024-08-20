@@ -1,0 +1,160 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+contract NFTMarketplace is ReentrancyGuard {
+    using Counters for Counters.Counter;
+
+    struct Auction {
+        address seller;
+        address highestBidder;
+        uint highestBid;
+        uint endTime;
+        bool ended;
+    }
+
+    struct Listing {
+        address seller;
+        uint price;
+        bool sold;
+    }
+
+    uint public platformFeePercent = 2; 
+    address payable public platformAddress;
+
+    Counters.Counter private _auctionIdCounter;
+    Counters.Counter private _listingIdCounter;
+
+    mapping(uint => Auction) public auctions;
+    mapping(uint => Listing) public listings;
+
+    IERC721 public nftContract;
+
+    event AuctionCreated(uint auctionId, uint tokenId, uint endTime);
+    event NewBid(uint auctionId, address bidder, uint bid);
+    event AuctionEnded(uint auctionId, address winner, uint highestBid);
+    event TokenListed(uint listingId, uint tokenId, uint price);
+    event TokenSold(uint listingId, address buyer, uint price);
+    event ListingCancelled(uint listingId);
+    event AuctionCancelled(uint auctionId);
+    event AuctionRestarted(uint auctionId, uint newEndTime);
+
+    constructor(address _nftContract, address payable _platformAddress) {
+        nftContract = IERC721(_nftContract);
+        platformAddress = _platformAddress;
+    }
+
+    function listToken(uint tokenId, uint price) external nonReentrant {
+        require(price > 0, "Price must be greater than zero");
+        nftContract.transferFrom(msg.sender, address(this), tokenId);
+
+        _listingIdCounter.increment();
+        uint listingId = _listingIdCounter.current();
+
+        listings[listingId] = Listing({
+            seller: msg.sender,
+            price: price,
+            sold: false
+        });
+
+        emit TokenListed(listingId, tokenId, price);
+    }
+
+    function createAuction(uint tokenId, uint startingBid, uint biddingTime) external nonReentrant {
+        require(startingBid > 0, "Starting bid must be greater than zero");
+        nftContract.transferFrom(msg.sender, address(this), tokenId);
+
+        _auctionIdCounter.increment();
+        uint auctionId = _auctionIdCounter.current();
+
+        auctions[auctionId] = Auction({
+            seller: msg.sender,
+            highestBidder: address(0),
+            highestBid: startingBid,
+            endTime: block.timestamp + biddingTime,
+            ended: false
+        });
+
+        emit AuctionCreated(auctionId, tokenId, block.timestamp + biddingTime);
+    }
+
+    function cancelListing(uint listingId) external nonReentrant {
+        Listing storage listing = listings[listingId];
+        require(msg.sender == listing.seller, "Only seller can cancel the listing");
+        require(!listing.sold, "Listing already sold");
+
+        nftContract.transferFrom(address(this), listing.seller, listingId);
+        delete listings[listingId];
+
+        emit ListingCancelled(listingId);
+    }
+
+    function cancelAuction(uint auctionId) external nonReentrant {
+        Auction storage auction = auctions[auctionId];
+        require(msg.sender == auction.seller, "Only seller can cancel the auction");
+        require(block.timestamp < auction.endTime, "Auction already ended");
+        require(auction.highestBidder == address(0), "Auction has a bid");
+
+        nftContract.transferFrom(address(this), auction.seller, auctionId);
+        delete auctions[auctionId];
+
+        emit AuctionCancelled(auctionId);
+    }
+
+    function restartAuction(uint auctionId, uint biddingTime) external nonReentrant {
+        Auction storage auction = auctions[auctionId];
+        require(msg.sender == auction.seller, "Only seller can restart the auction");
+        require(block.timestamp >= auction.endTime, "Auction is still ongoing");
+        require(auction.highestBidder == address(0), "Auction has a bid");
+
+        auction.endTime = block.timestamp + biddingTime;
+        auction.ended = false;
+
+        emit AuctionRestarted(auctionId, auction.endTime);
+    }
+
+    function bid(uint auctionId) external payable nonReentrant {
+        Auction storage auction = auctions[auctionId];
+        require(block.timestamp < auction.endTime, "Auction already ended");
+        require(msg.value > auction.highestBid, "There already is a higher bid");
+
+        // Extend auction if bid is placed in the last 5 minutes
+        if (auction.endTime - block.timestamp < 5 minutes) {
+            auction.endTime += 5 minutes;
+        }
+
+        if (auction.highestBidder != address(0)) {
+            payable(auction.highestBidder).transfer(auction.highestBid);
+        }
+
+        auction.highestBidder = msg.sender;
+        auction.highestBid = msg.value;
+
+        emit NewBid(auctionId, msg.sender, msg.value);
+    }
+
+    function endAuction(uint auctionId) external nonReentrant {
+        Auction storage auction = auctions[auctionId];
+        require(block.timestamp >= auction.endTime, "Auction not yet ended");
+        require(!auction.ended, "Auction end has already been called");
+
+        auction.ended = true;
+
+        uint platformFee = (auction.highestBid * platformFeePercent) / 100;
+        uint sellerAmount = auction.highestBid - platformFee;
+
+        if (auction.highestBidder != address(0)) {
+            nftContract.transferFrom(address(this), auction.highestBidder, auctionId);
+            payable(platformAddress).transfer(platformFee);
+            payable(auction.seller).transfer(sellerAmount);
+
+            emit AuctionEnded(auctionId, auction.highestBidder, auction.highestBid);
+        } else {
+            nftContract.transferFrom(address(this), auction.seller, auctionId);
+            emit AuctionCancelled(auctionId);
+        }
+    }
+}
